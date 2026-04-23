@@ -113,9 +113,96 @@ function normalized(value: string) {
   return value.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
+function cleanInput(value: string) {
+  return value.replace(/\r/g, "").trim();
+}
+
+function stripQuotedEmailThread(value: string) {
+  const lines = cleanInput(value).split("\n");
+  const kept: string[] = [];
+  let inQuotedBlock = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    const lower = line.toLowerCase();
+
+    if (
+      lower.startsWith("from:") ||
+      lower.startsWith("date:") ||
+      lower.startsWith("subject:") ||
+      lower.startsWith("to:") ||
+      /^on .+ wrote:$/i.test(line)
+    ) {
+      inQuotedBlock = true;
+    }
+
+    if (!inQuotedBlock) {
+      kept.push(rawLine);
+    }
+  }
+
+  return kept.join("\n").trim();
+}
+
+function extractDirective(value: string) {
+  const cleaned = cleanInput(value);
+  const firstChunk = cleaned.slice(0, 800);
+  const lines = firstChunk
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const directiveLines = lines.filter((line) => {
+    const lower = line.toLowerCase();
+    return (
+      lower.includes("need to") ||
+      lower.includes("write a reply") ||
+      lower.includes("respond to") ||
+      lower.includes("draft a reply") ||
+      lower.includes("reply to")
+    );
+  });
+
+  return directiveLines.join(" ").trim();
+}
+
+function prepareInputForGeneration(inputText: string) {
+  const directive = extractDirective(inputText);
+  const stripped = stripQuotedEmailThread(inputText);
+  const threadLike = threadNoiseScore(inputText) >= 2;
+
+  const preparedInput =
+    directive && threadLike
+      ? `${directive}\n\nSource thread for context:\n${stripped || cleanInput(inputText)}`
+      : cleanInput(inputText);
+
+  return {
+    preparedInput,
+    directive
+  };
+}
+
 function threadNoiseScore(value: string) {
-  const markers = ["from:", "date:", "subject:", "to:", "apr ", "would love to hear your solution", "goal focus:"];
+  const markers = ["from:", "date:", "subject:", "to:", "apr ", "goal focus:", "would love to hear your solution"];
   return markers.reduce((score, marker) => score + (normalized(value).includes(marker) ? 1 : 0), 0);
+}
+
+function overlapRatio(a: string, b: string) {
+  const first = new Set(normalized(a).split(" ").filter((token) => token.length > 3));
+  const second = new Set(normalized(b).split(" ").filter((token) => token.length > 3));
+
+  if (first.size === 0 || second.size === 0) {
+    return 0;
+  }
+
+  let overlap = 0;
+  for (const token of first) {
+    if (second.has(token)) {
+      overlap += 1;
+    }
+  }
+
+  return overlap / Math.min(first.size, second.size);
 }
 
 function isLikelyFallbackDraft(draft: GeneratorResult, inputText: string) {
@@ -132,6 +219,10 @@ function isLikelyFallbackDraft(draft: GeneratorResult, inputText: string) {
   }
 
   if (input.length > 120 && rewritten.includes(input.slice(0, Math.min(input.length, 180)))) {
+    return true;
+  }
+
+  if (threadNoiseScore(inputText) >= 2 && overlapRatio(draft.rewrittenMessage, inputText) > 0.72) {
     return true;
   }
 
@@ -187,6 +278,10 @@ function isBadSynthesis(result: SynthesisResult, inputText: string) {
     return true;
   }
 
+  if (threadNoiseScore(inputText) >= 2 && overlapRatio(result.finalVersion, inputText) > 0.7) {
+    return true;
+  }
+
   return false;
 }
 
@@ -218,14 +313,15 @@ export async function generateDrafts(args: {
   goal: string;
   attachments: { file_name: string; extracted_text: string }[];
 }) {
+  const prepared = prepareInputForGeneration(args.inputText);
   const openAiPromise = callOpenAI(
-    generatorPrompt({ modelLabel: "ChatGPT", inputText: args.inputText, goal: args.goal, attachments: args.attachments })
+    generatorPrompt({ modelLabel: "ChatGPT", inputText: prepared.preparedInput, goal: args.goal, attachments: args.attachments })
   )
     .then((raw) => parseWithSchema(raw, generatorSchema))
     .catch(() => fallbackGeneratorResult("ChatGPT", args.inputText, args.goal));
 
   const claudePromise = callClaude(
-    generatorPrompt({ modelLabel: "Claude", inputText: args.inputText, goal: args.goal, attachments: args.attachments })
+    generatorPrompt({ modelLabel: "Claude", inputText: prepared.preparedInput, goal: args.goal, attachments: args.attachments })
   )
     .then((raw) => parseWithSchema(raw, generatorSchema))
     .catch(() => fallbackGeneratorResult("Claude", args.inputText, args.goal));
