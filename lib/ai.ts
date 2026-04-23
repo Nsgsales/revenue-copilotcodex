@@ -4,6 +4,7 @@ import { z } from "zod";
 import {
   analysisPrompt,
   crossReviewPrompt,
+  directWinnerSynthesis,
   fallbackAnalysis,
   fallbackCrossReview,
   fallbackGeneratorResult,
@@ -108,6 +109,110 @@ async function callClaude(prompt: string) {
   return textBlocks.join("\n");
 }
 
+function normalized(value: string) {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function threadNoiseScore(value: string) {
+  const markers = ["from:", "date:", "subject:", "to:", "apr ", "would love to hear your solution", "goal focus:"];
+  return markers.reduce((score, marker) => score + (normalized(value).includes(marker) ? 1 : 0), 0);
+}
+
+function isLikelyFallbackDraft(draft: GeneratorResult, inputText: string) {
+  const version = normalized(draft.versionName);
+  const rewritten = normalized(draft.rewrittenMessage);
+  const input = normalized(inputText);
+
+  if (version.includes("fast pass")) {
+    return true;
+  }
+
+  if (rewritten.includes("goal focus:")) {
+    return true;
+  }
+
+  if (input.length > 120 && rewritten.includes(input.slice(0, Math.min(input.length, 180)))) {
+    return true;
+  }
+
+  return false;
+}
+
+function scoreDraft(draft: GeneratorResult, inputText: string) {
+  const rewritten = normalized(draft.rewrittenMessage);
+  let score = 0;
+
+  if (!isLikelyFallbackDraft(draft, inputText)) {
+    score += 4;
+  }
+
+  if (rewritten.startsWith("hi ") || rewritten.startsWith("hi,") || rewritten.startsWith("hello ")) {
+    score += 2;
+  }
+
+  if (rewritten.includes("?")) {
+    score += 2;
+  }
+
+  if (rewritten.includes("best,") || rewritten.includes("thanks,")) {
+    score += 1;
+  }
+
+  if (rewritten.length > 80 && rewritten.length < normalized(inputText).length * 1.25) {
+    score += 1;
+  }
+
+  score -= threadNoiseScore(rewritten) * 2;
+
+  return score;
+}
+
+function isBadSynthesis(result: SynthesisResult, inputText: string) {
+  const finalVersion = normalized(result.finalVersion);
+  const input = normalized(inputText);
+
+  if (finalVersion.includes("optimized for")) {
+    return true;
+  }
+
+  if (finalVersion.includes("goal focus:")) {
+    return true;
+  }
+
+  if (threadNoiseScore(finalVersion) >= 2) {
+    return true;
+  }
+
+  if (input.length > 120 && finalVersion.includes(input.slice(0, Math.min(input.length, 180)))) {
+    return true;
+  }
+
+  return false;
+}
+
+function bestDraft(args: { inputText: string; chatgpt: GeneratorResult; claude: GeneratorResult }) {
+  const chatgptScore = scoreDraft(args.chatgpt, args.inputText);
+  const claudeScore = scoreDraft(args.claude, args.inputText);
+
+  if (chatgptScore >= claudeScore) {
+    return {
+      winner: "chatgpt" as const,
+      winnerDraft: args.chatgpt,
+      loserDraft: args.claude,
+      winnerScore: chatgptScore,
+      loserScore: claudeScore
+    };
+  }
+
+  return {
+    winner: "claude" as const,
+    winnerDraft: args.claude,
+    loserDraft: args.chatgpt,
+    winnerScore: claudeScore,
+    loserScore: chatgptScore
+  };
+}
+
 export async function generateDrafts(args: {
   inputText: string;
   goal: string;
@@ -150,10 +255,43 @@ export async function synthesizeDrafts(args: {
   claude: GeneratorResult;
   analysis: AnalysisResult;
 }): Promise<SynthesisResult> {
+  const ranked = bestDraft(args);
+  const winnerWeak = ranked.winnerScore < 3;
+  const loserWeak = ranked.loserScore < 3;
+
+  if (!winnerWeak && loserWeak) {
+    return directWinnerSynthesis({
+      winner: ranked.winner,
+      goal: args.goal,
+      winnerDraft: ranked.winnerDraft,
+      loserWeak: true
+    });
+  }
+
   try {
     const raw = await callClaude(synthesisPrompt(args));
-    return parseWithSchema(raw, synthesisSchema);
+    const parsed = parseWithSchema(raw, synthesisSchema);
+
+    if (isBadSynthesis(parsed, args.inputText) && !winnerWeak) {
+      return directWinnerSynthesis({
+        winner: ranked.winner,
+        goal: args.goal,
+        winnerDraft: ranked.winnerDraft,
+        loserWeak
+      });
+    }
+
+    return parsed;
   } catch {
+    if (!winnerWeak) {
+      return directWinnerSynthesis({
+        winner: ranked.winner,
+        goal: args.goal,
+        winnerDraft: ranked.winnerDraft,
+        loserWeak
+      });
+    }
+
     return fallbackSynthesis(args.inputText, args.goal);
   }
 }

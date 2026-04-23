@@ -31,6 +31,8 @@ Task:
 - Rewrite or improve the user's message for the stated goal.
 - Be decisive and improve aggressively when needed.
 - Keep the result practical and usable right away.
+- If the input contains an email thread or conversation history, infer the likely task and draft the next response instead of repeating the thread.
+- Do not echo raw headers, quoted email history, or metadata unless absolutely necessary.
 
 Goal: ${args.goal}
 
@@ -229,6 +231,24 @@ export function fallbackSynthesis(inputText: string, goal: string): SynthesisRes
       "This version keeps the message direct, lowers friction for the reader, and sharpens the ask so the next step is easy to say yes to.",
     confidenceScore: "Medium",
     confidenceReason: "The structure is solid, but live model outputs and stronger source context would improve the result."
+  };
+}
+
+export function directWinnerSynthesis(args: {
+  winner: "chatgpt" | "claude";
+  goal: string;
+  winnerDraft: GeneratorResult;
+  loserWeak: boolean;
+}): SynthesisResult {
+  return {
+    finalVersion: args.winnerDraft.rewrittenMessage,
+    whyThisWorks: args.loserWeak
+      ? `This version was promoted directly because it was clearly stronger and more usable than the alternate draft for the ${args.goal} goal.`
+      : `This version was promoted because it best balanced clarity, persuasion, and a concrete next step for the ${args.goal} goal.`,
+    confidenceScore: args.loserWeak ? "Medium" : "High",
+    confidenceReason: args.loserWeak
+      ? "One model produced a strong usable answer while the other underperformed, so the strongest draft was selected directly."
+      : "The selected draft was clearly the best available answer and already reads like a sendable message."
   };
 }
 
